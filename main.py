@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from q2_image_qa import router as q2_router
 from q3_invoice_extract import router as q3_router
+from q4_dynamic_extract import router as q4_router
 
 
 app = FastAPI()
@@ -15,11 +16,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Existing Q2
+# Q2 - locked
 app.include_router(q2_router)
 
-# New Q3
+# Q3 - locked
 app.include_router(q3_router)
+
+# Q4 - new
+app.include_router(q4_router)
 
 
 @app.get("/")
@@ -29,6 +33,7 @@ def root():
         "endpoints": [
             "/answer-image",
             "/extract",
+            "/dynamic-extract",
         ],
     }
 
