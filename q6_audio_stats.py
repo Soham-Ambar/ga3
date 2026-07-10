@@ -12,10 +12,6 @@ from pydantic import BaseModel
 
 router = APIRouter()
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-
-# These are the only top-level keys the grader allows.
 REQUIRED_KEYS = [
     "rows",
     "columns",
@@ -54,52 +50,115 @@ class AudioStatisticsResponse(BaseModel):
     correlation: list[Any]
 
 
+def get_groq_client() -> Groq:
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="GROQ_API_KEY is not configured",
+        )
+
+    return Groq(
+        api_key=api_key,
+        timeout=120,
+        max_retries=2,
+    )
+
+
 def decode_audio(audio_base64: str) -> bytes:
-    """
-    Convert the base64 string sent by the grader into raw audio bytes.
+    encoded = audio_base64.strip()
 
-    It also supports data-URL input such as:
-    data:audio/wav;base64,UklGR...
-    """
+    # Support data URLs:
+    # data:audio/wav;base64,UklGR...
+    if encoded.lower().startswith("data:") and "," in encoded:
+        encoded = encoded.split(",", 1)[1]
 
-    encoded_data = audio_base64.strip()
-
-    if "," in encoded_data and encoded_data.lower().startswith("data:"):
-        encoded_data = encoded_data.split(",", 1)[1]
-
-    # Remove whitespace or newlines that may exist in the base64 string.
-    encoded_data = "".join(encoded_data.split())
+    encoded = "".join(encoded.split())
 
     try:
-        return base64.b64decode(encoded_data, validate=True)
+        audio_bytes = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as error:
         raise HTTPException(
             status_code=400,
-            detail="audio_base64 is not valid base64 audio",
+            detail="audio_base64 is not valid base64",
         ) from error
+
+    if not audio_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="Decoded audio is empty",
+        )
+
+    return audio_bytes
+
+
+def detect_audio_extension(audio_bytes: bytes) -> str:
+    """
+    Detect the actual audio format using file signatures.
+    """
+
+    # WAV: RIFF....WAVE
+    if (
+        len(audio_bytes) >= 12
+        and audio_bytes[:4] == b"RIFF"
+        and audio_bytes[8:12] == b"WAVE"
+    ):
+        return ".wav"
+
+    # MP3 with ID3 metadata
+    if audio_bytes[:3] == b"ID3":
+        return ".mp3"
+
+    # MP3 frame header
+    if len(audio_bytes) >= 2:
+        first = audio_bytes[0]
+        second = audio_bytes[1]
+
+        if first == 0xFF and (second & 0xE0) == 0xE0:
+            return ".mp3"
+
+    # FLAC
+    if audio_bytes[:4] == b"fLaC":
+        return ".flac"
+
+    # OGG
+    if audio_bytes[:4] == b"OggS":
+        return ".ogg"
+
+    # WebM / Matroska
+    if audio_bytes[:4] == bytes.fromhex("1A45DFA3"):
+        return ".webm"
+
+    # MP4, M4A and related containers
+    if len(audio_bytes) >= 12 and audio_bytes[4:8] == b"ftyp":
+        return ".m4a"
+
+    # Use WAV as a safe filename fallback.
+    return ".wav"
 
 
 def transcribe_audio(audio_bytes: bytes) -> str:
-    """
-    Send the decoded audio to Groq Whisper and return its transcript.
-    """
+    client = get_groq_client()
+    extension = detect_audio_extension(audio_bytes)
 
     temporary_path = None
 
     try:
-        # The exact incoming audio format may be WAV, MP3, M4A, etc.
-        # Groq detects the real format from the file contents.
         with tempfile.NamedTemporaryFile(
             delete=False,
-            suffix=".audio",
+            suffix=extension,
         ) as temporary_file:
             temporary_file.write(audio_bytes)
             temporary_path = temporary_file.name
 
         with open(temporary_path, "rb") as audio_file:
             transcription = client.audio.transcriptions.create(
-                file=(f"recording_{os.path.basename(temporary_path)}", audio_file),
-                model="whisper-large-v3",
+                file=(
+                    f"korean_audio{extension}",
+                    audio_file,
+                ),
+                model="whisper-large-v3-turbo",
                 language="ko",
                 response_format="json",
                 temperature=0,
@@ -113,7 +172,7 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         if not transcript or not transcript.strip():
             raise HTTPException(
                 status_code=422,
-                detail="The audio could not be transcribed",
+                detail="Audio transcription was empty",
             )
 
         return transcript.strip()
@@ -122,8 +181,14 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         raise
 
     except Exception as error:
+        print(
+            f"Q6 transcription error: "
+            f"{type(error).__name__}: {error}",
+            flush=True,
+        )
+
         raise HTTPException(
-            status_code=502,
+            status_code=500,
             detail=f"Audio transcription failed: {str(error)}",
         ) from error
 
@@ -135,56 +200,51 @@ def transcribe_audio(audio_bytes: bytes) -> str:
                 pass
 
 
-def parse_json_content(content: str) -> dict[str, Any]:
-    """
-    Parse JSON returned by the language model.
-
-    This also removes accidental ```json fences if the model adds them.
-    """
-
+def clean_json_response(content: str) -> dict[str, Any]:
     cleaned = content.strip()
 
-    if cleaned.startswith("```"):
-        cleaned = cleaned.removeprefix("```json")
-        cleaned = cleaned.removeprefix("```JSON")
-        cleaned = cleaned.removeprefix("```")
-        cleaned = cleaned.removesuffix("```")
-        cleaned = cleaned.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+
+    cleaned = cleaned.strip()
 
     try:
-        parsed = json.loads(cleaned)
+        result = json.loads(cleaned)
     except json.JSONDecodeError as error:
+        print(
+            f"Q6 invalid model JSON: {cleaned}",
+            flush=True,
+        )
+
         raise HTTPException(
-            status_code=502,
-            detail="The statistics model returned invalid JSON",
+            status_code=500,
+            detail="Statistics model returned invalid JSON",
         ) from error
 
-    if not isinstance(parsed, dict):
+    if not isinstance(result, dict):
         raise HTTPException(
-            status_code=502,
-            detail="The statistics model did not return a JSON object",
+            status_code=500,
+            detail="Statistics model did not return an object",
         )
 
-    return parsed
+    return result
 
 
-def validate_and_normalize(result: dict[str, Any]) -> dict[str, Any]:
-    """
-    Ensure the response contains exactly the keys required by the grader.
-    """
+def validate_result(result: dict[str, Any]) -> dict[str, Any]:
+    missing_keys = set(REQUIRED_KEYS) - set(result.keys())
 
-    result_keys = set(result.keys())
-    expected_keys = set(REQUIRED_KEYS)
-
-    missing = expected_keys - result_keys
-
-    if missing:
+    if missing_keys:
         raise HTTPException(
-            status_code=502,
-            detail=f"Statistics response is missing keys: {sorted(missing)}",
+            status_code=500,
+            detail=f"Missing result keys: {sorted(missing_keys)}",
         )
 
-    # Construct a brand-new object so that accidental extra keys are removed.
+    # Rebuild the dictionary so no extra keys are returned.
     normalized = {
         "rows": result["rows"],
         "columns": result["columns"],
@@ -204,9 +264,14 @@ def validate_and_normalize(result: dict[str, Any]) -> dict[str, Any]:
     try:
         validated = AudioStatisticsResponse.model_validate(normalized)
     except Exception as error:
+        print(
+            f"Q6 validation error: {error}",
+            flush=True,
+        )
+
         raise HTTPException(
-            status_code=502,
-            detail=f"Statistics response has incorrect data types: {str(error)}",
+            status_code=500,
+            detail=f"Incorrect result data types: {str(error)}",
         ) from error
 
     return validated.model_dump()
@@ -216,76 +281,16 @@ def analyze_transcript(
     audio_id: str,
     transcript: str,
 ) -> dict[str, Any]:
-    """
-    Ask the language model to understand the Korean dataset description
-    and calculate the requested statistics.
-    """
+    client = get_groq_client()
 
     system_prompt = """
-You are a highly accurate dataset-statistics extraction engine.
+You are a precise Korean-language dataset analysis system.
 
-You will receive a transcript of Korean speech. The speech describes a
-dataset, table, records, columns, values, categories, ranges, and statistics.
+The user provides a transcript of Korean audio describing a dataset. Extract
+all records, columns, values, constraints, categories and requested
+statistics from the transcript.
 
-Your job is to understand the Korean transcript and return the exact dataset
-statistics requested by the speaker.
-
-Important calculation rules:
-
-1. Translate and understand Korean accurately, but preserve column names and
-   category values exactly as specified in the audio.
-
-2. "rows" is the number of data rows, excluding any header.
-
-3. "columns" must contain column names in their original stated order.
-
-4. For every numeric column, calculate:
-   - mean
-   - standard deviation
-   - variance
-   - minimum
-   - maximum
-   - median
-   - mode
-   - range
-
-5. Use sample standard deviation and sample variance, equivalent to:
-   pandas Series.std(ddof=1)
-   pandas Series.var(ddof=1)
-
-6. range means maximum minus minimum.
-
-7. For categorical columns, use allowed_values where requested. Preserve the
-   stated value order when the transcript specifies an order.
-
-8. value_range contains the minimum and maximum permitted or observed limits
-   requested in the speech.
-
-9. correlation must follow the exact format and column order requested in the
-   speech. Use Pearson correlation when correlation is requested.
-
-10. Do not invent data that is not present in the transcript.
-
-11. Numbers must be JSON numbers, not strings.
-
-12. Empty sections must be represented by {} or [] as appropriate.
-
-13. Return exactly these thirteen top-level keys and no others:
-    rows
-    columns
-    mean
-    std
-    variance
-    min
-    max
-    median
-    mode
-    range
-    allowed_values
-    value_range
-    correlation
-
-Required JSON shape:
+Return exactly one JSON object with exactly these top-level keys:
 
 {
   "rows": 0,
@@ -303,28 +308,43 @@ Required JSON shape:
   "correlation": []
 }
 
-Check every arithmetic result carefully before returning the answer.
-Return only one valid JSON object. Do not return markdown or explanations.
+Rules:
+
+1. rows is the number of data rows, excluding the header.
+2. columns preserves the requested column order.
+3. Calculate numeric statistics accurately.
+4. Use pandas-compatible sample standard deviation and sample variance:
+   std uses ddof=1 and variance uses ddof=1.
+5. range is maximum minus minimum.
+6. mode is the most frequent value requested for each applicable column.
+7. Preserve column names and categorical values exactly as spoken.
+8. allowed_values must preserve any order specified in the transcript.
+9. value_range must use the exact structure requested in the transcript.
+10. correlation must preserve the exact requested structure and order.
+11. Use Pearson correlation unless another method is explicitly requested.
+12. JSON numeric values must be numbers, not strings.
+13. Empty objects must be {} and empty arrays must be [].
+14. Do not add any extra top-level keys.
+15. Check all arithmetic carefully.
+16. Return only valid JSON, with no markdown or explanation.
 """.strip()
 
     user_prompt = f"""
-Audio identifier: {audio_id}
+Audio ID: {audio_id}
 
-Korean audio transcript:
-
---- TRANSCRIPT START ---
+Korean transcript:
 {transcript}
---- TRANSCRIPT END ---
 
-Extract the dataset and calculate all requested statistics. Return only the
-required JSON object.
+Analyze the described dataset and return the required JSON.
 """.strip()
 
     try:
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             temperature=0,
-            response_format={"type": "json_object"},
+            response_format={
+                "type": "json_object",
+            },
             messages=[
                 {
                     "role": "system",
@@ -341,19 +361,25 @@ required JSON object.
 
         if not content:
             raise HTTPException(
-                status_code=502,
-                detail="The statistics model returned an empty response",
+                status_code=500,
+                detail="Statistics model returned an empty response",
             )
 
-        result = parse_json_content(content)
-        return validate_and_normalize(result)
+        result = clean_json_response(content)
+        return validate_result(result)
 
     except HTTPException:
         raise
 
     except Exception as error:
+        print(
+            f"Q6 analysis error: "
+            f"{type(error).__name__}: {error}",
+            flush=True,
+        )
+
         raise HTTPException(
-            status_code=502,
+            status_code=500,
             detail=f"Dataset analysis failed: {str(error)}",
         ) from error
 
@@ -361,29 +387,34 @@ required JSON object.
 @router.post(
     "/audio-stats",
     response_model=AudioStatisticsResponse,
-    response_model_exclude_none=False,
 )
 def audio_statistics(request: AudioStatisticsRequest):
-    """
-    Q6 endpoint:
-
-    1. Decode the base64 audio.
-    2. Transcribe the Korean speech.
-    3. Extract and calculate the dataset statistics.
-    4. Return exactly the required JSON structure.
-    """
-
     audio_bytes = decode_audio(request.audio_base64)
 
-    if len(audio_bytes) == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Decoded audio is empty",
-        )
+    print(
+        f"Q6 request: audio_id={request.audio_id}, "
+        f"bytes={len(audio_bytes)}, "
+        f"format={detect_audio_extension(audio_bytes)}",
+        flush=True,
+    )
 
     transcript = transcribe_audio(audio_bytes)
 
-    return analyze_transcript(
+    print(
+        f"Q6 transcript for {request.audio_id}: {transcript}",
+        flush=True,
+    )
+
+    result = analyze_transcript(
         audio_id=request.audio_id,
         transcript=transcript,
     )
+
+    return result
+
+
+@router.get("/audio-stats")
+def audio_statistics_information():
+    return {
+        "message": "Use POST with audio_id and audio_base64"
+    }
