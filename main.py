@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from q2_image_qa import router as q2_router
 from q3_invoice_extract import router as q3_router
 from q4_dynamic_extract import router as q4_router
+from q6_audio_stats import router as q6_router
 
 
 app = FastAPI()
@@ -22,8 +23,11 @@ app.include_router(q2_router)
 # Q3 - locked
 app.include_router(q3_router)
 
-# Q4 - new
+# Q4 - locked
 app.include_router(q4_router)
+
+# Q6 - Korean audio dataset statistics
+app.include_router(q6_router)
 
 
 @app.get("/")
@@ -34,6 +38,7 @@ def root():
             "/answer-image",
             "/extract",
             "/dynamic-extract",
+            "/audio-stats",
         ],
     }
 
