@@ -69,15 +69,19 @@ def get_groq_client() -> Groq:
 def decode_audio(audio_base64: str) -> bytes:
     encoded = audio_base64.strip()
 
-    # Support data URLs:
+    # Also accept data URLs such as:
     # data:audio/wav;base64,UklGR...
     if encoded.lower().startswith("data:") and "," in encoded:
         encoded = encoded.split(",", 1)[1]
 
+    # Remove spaces and line breaks from base64.
     encoded = "".join(encoded.split())
 
     try:
-        audio_bytes = base64.b64decode(encoded, validate=True)
+        audio_bytes = base64.b64decode(
+            encoded,
+            validate=True,
+        )
     except (binascii.Error, ValueError) as error:
         raise HTTPException(
             status_code=400,
@@ -94,10 +98,6 @@ def decode_audio(audio_base64: str) -> bytes:
 
 
 def detect_audio_extension(audio_bytes: bytes) -> str:
-    """
-    Detect the actual audio format using file signatures.
-    """
-
     # WAV: RIFF....WAVE
     if (
         len(audio_bytes) >= 12
@@ -106,35 +106,35 @@ def detect_audio_extension(audio_bytes: bytes) -> str:
     ):
         return ".wav"
 
-    # MP3 with ID3 metadata
+    # MP3 containing an ID3 header.
     if audio_bytes[:3] == b"ID3":
         return ".mp3"
 
-    # MP3 frame header
+    # MP3 frame header.
     if len(audio_bytes) >= 2:
-        first = audio_bytes[0]
-        second = audio_bytes[1]
+        first_byte = audio_bytes[0]
+        second_byte = audio_bytes[1]
 
-        if first == 0xFF and (second & 0xE0) == 0xE0:
+        if first_byte == 0xFF and (second_byte & 0xE0) == 0xE0:
             return ".mp3"
 
-    # FLAC
+    # FLAC.
     if audio_bytes[:4] == b"fLaC":
         return ".flac"
 
-    # OGG
+    # OGG.
     if audio_bytes[:4] == b"OggS":
         return ".ogg"
 
-    # WebM / Matroska
+    # WebM or Matroska.
     if audio_bytes[:4] == bytes.fromhex("1A45DFA3"):
         return ".webm"
 
-    # MP4, M4A and related containers
+    # MP4 or M4A container.
     if len(audio_bytes) >= 12 and audio_bytes[4:8] == b"ftyp":
         return ".m4a"
 
-    # Use WAV as a safe filename fallback.
+    # The assignment normally provides WAV audio.
     return ".wav"
 
 
@@ -142,7 +142,7 @@ def transcribe_audio(audio_bytes: bytes) -> str:
     client = get_groq_client()
     extension = detect_audio_extension(audio_bytes)
 
-    temporary_path = None
+    temporary_path: str | None = None
 
     try:
         with tempfile.NamedTemporaryFile(
@@ -164,7 +164,11 @@ def transcribe_audio(audio_bytes: bytes) -> str:
                 temperature=0,
             )
 
-        transcript = getattr(transcription, "text", None)
+        transcript = getattr(
+            transcription,
+            "text",
+            None,
+        )
 
         if not transcript and isinstance(transcription, dict):
             transcript = transcription.get("text")
@@ -182,14 +186,14 @@ def transcribe_audio(audio_bytes: bytes) -> str:
 
     except Exception as error:
         print(
-            f"Q6 transcription error: "
+            "Q6 transcription error: "
             f"{type(error).__name__}: {error}",
             flush=True,
         )
 
         raise HTTPException(
             status_code=500,
-            detail=f"Audio transcription failed: {str(error)}",
+            detail=f"Audio transcription failed: {error}",
         ) from error
 
     finally:
@@ -204,6 +208,8 @@ def clean_json_response(content: str) -> dict[str, Any]:
     cleaned = content.strip()
 
     if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```JSON"):
         cleaned = cleaned[7:]
     elif cleaned.startswith("```"):
         cleaned = cleaned[3:]
@@ -229,7 +235,7 @@ def clean_json_response(content: str) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise HTTPException(
             status_code=500,
-            detail="Statistics model did not return an object",
+            detail="Statistics model did not return a JSON object",
         )
 
     return result
@@ -244,7 +250,7 @@ def validate_result(result: dict[str, Any]) -> dict[str, Any]:
             detail=f"Missing result keys: {sorted(missing_keys)}",
         )
 
-    # Rebuild the dictionary so no extra keys are returned.
+    # Rebuild the response to remove all unexpected top-level keys.
     normalized = {
         "rows": result["rows"],
         "columns": result["columns"],
@@ -262,7 +268,9 @@ def validate_result(result: dict[str, Any]) -> dict[str, Any]:
     }
 
     try:
-        validated = AudioStatisticsResponse.model_validate(normalized)
+        validated = AudioStatisticsResponse.model_validate(
+            normalized
+        )
     except Exception as error:
         print(
             f"Q6 validation error: {error}",
@@ -271,7 +279,7 @@ def validate_result(result: dict[str, Any]) -> dict[str, Any]:
 
         raise HTTPException(
             status_code=500,
-            detail=f"Incorrect result data types: {str(error)}",
+            detail=f"Incorrect result data types: {error}",
         ) from error
 
     return validated.model_dump()
@@ -284,13 +292,12 @@ def analyze_transcript(
     client = get_groq_client()
 
     system_prompt = """
-You are a precise Korean-language dataset analysis system.
+You are a precise Korean-language dataset instruction parser and calculator.
 
-The user provides a transcript of Korean audio describing a dataset. Extract
-all records, columns, values, constraints, categories and requested
-statistics from the transcript.
+The Korean audio transcript describes a dataset and explicitly requests
+particular outputs. Return only values explicitly requested in the audio.
 
-Return exactly one JSON object with exactly these top-level keys:
+You must always return exactly these thirteen top-level keys:
 
 {
   "rows": 0,
@@ -308,34 +315,141 @@ Return exactly one JSON object with exactly these top-level keys:
   "correlation": []
 }
 
-Rules:
+CRITICAL RULE:
 
-1. rows is the number of data rows, excluding the header.
-2. columns preserves the requested column order.
-3. Calculate numeric statistics accurately.
-4. Use pandas-compatible sample standard deviation and sample variance:
-   std uses ddof=1 and variance uses ddof=1.
-5. range is maximum minus minimum.
-6. mode is the most frequent value requested for each applicable column.
-7. Preserve column names and categorical values exactly as spoken.
-8. allowed_values must preserve any order specified in the transcript.
-9. value_range must use the exact structure requested in the transcript.
-10. correlation must preserve the exact requested structure and order.
-11. Use Pearson correlation unless another method is explicitly requested.
-12. JSON numeric values must be numbers, not strings.
-13. Empty objects must be {} and empty arrays must be [].
-14. Do not add any extra top-level keys.
-15. Check all arithmetic carefully.
-16. Return only valid JSON, with no markdown or explanation.
+Do not automatically calculate every statistic for every numeric column.
+
+For each statistics section, include a column only when the Korean audio
+explicitly requests that exact statistic for that column.
+
+Examples:
+
+If the audio requests only the mean of "소득", return:
+
+{
+  "rows": 0,
+  "columns": [],
+  "mean": {"소득": 123},
+  "std": {},
+  "variance": {},
+  "min": {},
+  "max": {},
+  "median": {},
+  "mode": {},
+  "range": {},
+  "allowed_values": {},
+  "value_range": {},
+  "correlation": []
+}
+
+If the audio requests minimum but not maximum, populate "min" and leave
+"max" as {}.
+
+If it requests maximum but not minimum, populate "max" and leave "min"
+as {}.
+
+If it requests variance but not standard deviation, populate "variance"
+and leave "std" as {}.
+
+If it requests standard deviation but not variance, populate "std" and
+leave "variance" as {}.
+
+If it requests allowed values but not mode, populate "allowed_values"
+and leave "mode" as {}.
+
+If no correlation is requested, return "correlation": [].
+
+Never infer that a related statistic was requested:
+
+- Requesting min does not imply max.
+- Requesting max does not imply min.
+- Requesting min and max does not imply range.
+- Requesting variance does not imply standard deviation.
+- Requesting standard deviation does not imply variance.
+- Requesting mean does not imply median.
+- Requesting mean does not imply mode.
+- Requesting allowed values does not imply mode.
+- Requesting observed minimum and maximum does not imply value_range.
+
+Detailed rules:
+
+1. "rows":
+   Return the dataset row count only when the audio explicitly requests
+   or specifies that rows must be returned. Otherwise return 0.
+
+2. "columns":
+   Return column names only when the audio explicitly requests or specifies
+   them as an output. Preserve their exact required order.
+   Otherwise return [].
+
+3. For mean, std, variance, min, max, median, mode, and range:
+   populate only the exact requested section and the exact requested columns.
+
+4. Use sample standard deviation and sample variance compatible with pandas:
+   Series.std(ddof=1)
+   Series.var(ddof=1)
+
+5. Calculate range as maximum minus minimum only when "range" itself is
+   explicitly requested.
+
+6. "allowed_values":
+   Include only explicitly requested categorical allowed values.
+   Preserve their exact order when an order is stated.
+
+7. "value_range":
+   Include only explicitly requested permitted ranges, bounds, or domains.
+   Do not populate value_range merely because min and max can be computed.
+
+8. "correlation":
+   Include correlations only when explicitly requested.
+   Use Pearson correlation unless another method is explicitly stated.
+   Preserve the required structure and order exactly.
+
+9. Preserve Korean column names and categorical values exactly as required
+   by the transcript.
+
+10. JSON numbers must be numbers, not strings.
+
+11. Every unrequested dictionary section must be exactly {}.
+
+12. Every unrequested array section must be exactly [].
+
+13. Do not add extra top-level keys.
+
+14. Do not populate fields merely because the necessary data is available.
+
+15. Before returning, inspect every non-empty field and confirm that the
+    transcript explicitly requested it. Remove every unrequested value.
+
+16. Check all arithmetic carefully.
+
+Return only one valid JSON object.
+Do not return markdown, commentary, translation, or explanation.
 """.strip()
 
     user_prompt = f"""
 Audio ID: {audio_id}
 
 Korean transcript:
-{transcript}
 
-Analyze the described dataset and return the required JSON.
+--- START OF TRANSCRIPT ---
+{transcript}
+--- END OF TRANSCRIPT ---
+
+First determine exactly which output fields and statistics the Korean audio
+requests.
+
+Then calculate only those requested outputs.
+
+Populate only explicitly requested fields.
+
+Leave every unrequested dictionary as {{}}.
+Leave every unrequested list as [].
+Use 0 for rows when rows are not requested.
+
+Do not calculate or return additional related statistics.
+
+Return only the required JSON object.
 """.strip()
 
     try:
@@ -366,6 +480,7 @@ Analyze the described dataset and return the required JSON.
             )
 
         result = clean_json_response(content)
+
         return validate_result(result)
 
     except HTTPException:
@@ -373,14 +488,14 @@ Analyze the described dataset and return the required JSON.
 
     except Exception as error:
         print(
-            f"Q6 analysis error: "
+            "Q6 analysis error: "
             f"{type(error).__name__}: {error}",
             flush=True,
         )
 
         raise HTTPException(
             status_code=500,
-            detail=f"Dataset analysis failed: {str(error)}",
+            detail=f"Dataset analysis failed: {error}",
         ) from error
 
 
@@ -388,13 +503,17 @@ Analyze the described dataset and return the required JSON.
     "/audio-stats",
     response_model=AudioStatisticsResponse,
 )
-def audio_statistics(request: AudioStatisticsRequest):
+def audio_statistics(
+    request: AudioStatisticsRequest,
+) -> dict[str, Any]:
     audio_bytes = decode_audio(request.audio_base64)
+
+    detected_format = detect_audio_extension(audio_bytes)
 
     print(
         f"Q6 request: audio_id={request.audio_id}, "
         f"bytes={len(audio_bytes)}, "
-        f"format={detect_audio_extension(audio_bytes)}",
+        f"format={detected_format}",
         flush=True,
     )
 
@@ -408,6 +527,15 @@ def audio_statistics(request: AudioStatisticsRequest):
     result = analyze_transcript(
         audio_id=request.audio_id,
         transcript=transcript,
+    )
+
+    print(
+        "Q6 final response: "
+        + json.dumps(
+            result,
+            ensure_ascii=False,
+        ),
+        flush=True,
     )
 
     return result
