@@ -5,6 +5,7 @@ from q2_image_qa import router as q2_router
 from q3_invoice_extract import router as q3_router
 from q4_dynamic_extract import router as q4_router
 from q6_audio_stats import router as q6_router
+from q7_invoice_intelligence import router as q7_router
 
 
 app = FastAPI()
@@ -26,8 +27,11 @@ app.include_router(q3_router)
 # Q4 - locked
 app.include_router(q4_router)
 
-# Q6 - Korean audio dataset statistics
+# Q6 - temporarily skipped, but route remains available
 app.include_router(q6_router)
+
+# Q7 - Invoice Intelligence
+app.include_router(q7_router)
 
 
 @app.get("/")
@@ -39,6 +43,7 @@ def root():
             "/extract",
             "/dynamic-extract",
             "/audio-stats",
+            "/invoice-intelligence",
         ],
     }
 
