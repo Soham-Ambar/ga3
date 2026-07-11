@@ -6,7 +6,7 @@ from typing import Any, Literal
 import dateparser
 from fastapi import APIRouter, HTTPException
 from groq import Groq
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 router = APIRouter()
@@ -29,7 +29,14 @@ EXPECTED_KEYS = {
 class InvoiceRequest(BaseModel):
     document_id: str
     text: str
-    schema: dict[str, Any]
+
+    # Accept incoming JSON key "schema" without creating
+    # the Pydantic warning about shadowing BaseModel.schema.
+    requested_schema: dict[str, Any] = Field(alias="schema")
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
 
 
 class LineItem(BaseModel):
@@ -63,7 +70,13 @@ STRICT_INVOICE_SCHEMA = {
         },
         "currency": {
             "type": "string",
-            "enum": ["USD", "EUR", "GBP", "INR", "JPY"],
+            "enum": [
+                "USD",
+                "EUR",
+                "GBP",
+                "INR",
+                "JPY",
+            ],
         },
         "total_amount": {
             "type": "integer",
@@ -79,7 +92,12 @@ STRICT_INVOICE_SCHEMA = {
         },
         "priority": {
             "type": "string",
-            "enum": ["low", "normal", "high", "urgent"],
+            "enum": [
+                "low",
+                "normal",
+                "high",
+                "urgent",
+            ],
         },
         "contact_email": {
             "type": "string",
@@ -143,14 +161,20 @@ def get_groq_client() -> Groq:
     )
 
 
-def clean_integer(value: Any, field_name: str) -> int:
+def clean_integer(
+    value: Any,
+    field_name: str,
+) -> int:
     """
-    Ensure a value becomes a real JSON integer.
+    Convert a generated value into a real integer.
 
-    This handles accidental values such as:
+    Supported examples:
+    12480
+    12480.0
     "12,480"
     "1,24,800"
-    "12480.0"
+    "$12480"
+    "₹1,24,800"
     """
 
     if isinstance(value, bool):
@@ -173,12 +197,17 @@ def clean_integer(value: Any, field_name: str) -> int:
 
     if isinstance(value, str):
         cleaned = value.strip()
-        cleaned = cleaned.replace(",", "")
-        cleaned = cleaned.replace("₹", "")
-        cleaned = cleaned.replace("$", "")
-        cleaned = cleaned.replace("€", "")
-        cleaned = cleaned.replace("£", "")
-        cleaned = cleaned.replace("¥", "")
+
+        for character in [
+            ",",
+            "₹",
+            "$",
+            "€",
+            "£",
+            "¥",
+        ]:
+            cleaned = cleaned.replace(character, "")
+
         cleaned = cleaned.strip()
 
         try:
@@ -203,14 +232,50 @@ def clean_integer(value: Any, field_name: str) -> int:
     )
 
 
+def normalize_vendor(value: str) -> str:
+    """
+    Remove punctuation that merely ends the invoice sentence while
+    preserving punctuation that is normally part of a legal company name.
+    """
+
+    vendor = value.strip()
+
+    legal_suffixes = (
+        "Inc.",
+        "Ltd.",
+        "Co.",
+        "Corp.",
+        "Pvt.",
+        "L.L.C.",
+        "S.A.",
+        "S.p.A.",
+    )
+
+    if vendor.endswith(legal_suffixes):
+        return vendor
+
+    # Remove punctuation added only because the company name
+    # appeared at the end of a sentence.
+    vendor = re.sub(
+        r"[.,;:!?]+$",
+        "",
+        vendor,
+    ).strip()
+
+    return vendor
+
+
 def normalize_date(value: str) -> str:
     """
-    Ensure the date is returned as YYYY-MM-DD.
+    Return invoice date in YYYY-MM-DD format.
     """
 
     value = value.strip()
 
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+    if re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}",
+        value,
+    ):
         return value
 
     parsed = dateparser.parse(
@@ -225,7 +290,10 @@ def normalize_date(value: str) -> str:
     if parsed is None:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not normalize invoice date: {value}",
+            detail=(
+                "Could not normalize invoice date: "
+                f"{value}"
+            ),
         )
 
     return parsed.strftime("%Y-%m-%d")
@@ -259,9 +327,20 @@ def normalize_currency(value: str) -> str:
         "JAPANESE YEN": "JPY",
     }
 
-    currency = aliases.get(currency, currency)
+    currency = aliases.get(
+        currency,
+        currency,
+    )
 
-    if currency not in {"USD", "EUR", "GBP", "INR", "JPY"}:
+    allowed = {
+        "USD",
+        "EUR",
+        "GBP",
+        "INR",
+        "JPY",
+    }
+
+    if currency not in allowed:
         raise HTTPException(
             status_code=500,
             detail=f"Unsupported currency: {value}",
@@ -285,14 +364,19 @@ def normalize_priority(value: str) -> str:
         "asap": "urgent",
     }
 
-    priority = aliases.get(priority, priority)
+    priority = aliases.get(
+        priority,
+        priority,
+    )
 
-    if priority not in {
+    allowed = {
         "low",
         "normal",
         "high",
         "urgent",
-    }:
+    }
+
+    if priority not in allowed:
         raise HTTPException(
             status_code=500,
             detail=f"Unsupported priority: {value}",
@@ -316,6 +400,7 @@ def normalize_boolean(value: Any) -> bool:
             "settled",
             "complete",
             "completed",
+            "payment received",
         }
 
         false_values = {
@@ -324,6 +409,7 @@ def normalize_boolean(value: Any) -> bool:
             "unpaid",
             "awaiting payment",
             "pending",
+            "pending payment",
             "outstanding",
         }
 
@@ -354,18 +440,21 @@ def normalize_line_items(
 
     normalized_items = []
 
+    expected_item_keys = {
+        "sku",
+        "quantity",
+        "unit_price",
+    }
+
     for index, item in enumerate(raw_items):
         if not isinstance(item, dict):
             raise HTTPException(
                 status_code=500,
-                detail=f"line_items[{index}] must be an object",
+                detail=(
+                    f"line_items[{index}] "
+                    "must be an object"
+                ),
             )
-
-        expected_item_keys = {
-            "sku",
-            "quantity",
-            "unit_price",
-        }
 
         if set(item.keys()) != expected_item_keys:
             raise HTTPException(
@@ -397,7 +486,7 @@ def normalize_result(
     raw_result: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Force exact keys, types, casing and derived item count.
+    Force exact keys, types, casing and item count.
     """
 
     if set(raw_result.keys()) != EXPECTED_KEYS:
@@ -415,7 +504,9 @@ def normalize_result(
     )
 
     normalized = {
-        "vendor": str(raw_result["vendor"]).strip(),
+        "vendor": normalize_vendor(
+            str(raw_result["vendor"])
+        ),
         "currency": normalize_currency(
             str(raw_result["currency"])
         ),
@@ -441,8 +532,8 @@ def normalize_result(
         ),
         "line_items": line_items,
 
-        # Never trust a generated count.
-        # Derive it from the final ordered line-item list.
+        # Always calculate item_count from the final
+        # ordered line-item array.
         "item_count": len(line_items),
     }
 
@@ -453,7 +544,10 @@ def normalize_result(
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"Invoice validation failed: {error}",
+            detail=(
+                "Invoice validation failed: "
+                f"{error}"
+            ),
         ) from error
 
     return validated.model_dump()
@@ -475,14 +569,32 @@ provided schema exactly.
 Follow these rules strictly:
 
 1. vendor
-   Return the biller's proper name exactly as written in the invoice.
-   Do not change spelling, punctuation, capitalization or legal suffixes.
+
+   Return only the biller's proper company name.
+
+   Do not include sentence-ending punctuation that follows the company name.
+
+   Example:
+
+   "Invoice issued by Vertex Cloud Systems."
+
+   must produce:
+
+   "Vertex Cloud Systems"
+
+   Preserve punctuation only when it is genuinely part of the legal company
+   name, such as "Acme, Inc." or "Example Co.".
+
+   Preserve spelling, capitalization and legal suffixes.
 
 2. currency
+
    Return only one ISO 4217 code:
+
    USD, EUR, GBP, INR or JPY.
 
    Currency examples:
+
    dollars, US dollars, $ -> USD
    euros, euro, € -> EUR
    pounds sterling, pounds, £ -> GBP
@@ -490,10 +602,13 @@ Follow these rules strictly:
    yen, Japanese yen, ¥ -> JPY
 
 3. total_amount
+
    Return an integer in the main currency unit.
+
    Remove currency symbols and separators.
 
    Correctly understand:
+
    12,480 -> 12480
    1,24,800 -> 124800
    12K -> 12000
@@ -503,14 +618,19 @@ Follow these rules strictly:
    "one lakh twenty-four thousand eight hundred" -> 124800
 
 4. invoice_date
+
    Convert every date format to YYYY-MM-DD.
+
    Understand numeric dates, month names and ordinal dates.
+
    Use the actual invoice date, not the due date or payment date.
 
 5. due_in_days
+
    Return an integer number of days.
 
    Examples:
+
    Net 30 -> 30
    payable within 45 days -> 45
    due in two weeks -> 14
@@ -520,30 +640,49 @@ Follow these rules strictly:
    due on receipt -> 0
 
 6. is_paid
+
    Return true for wording such as:
-   paid, paid in full, settled, payment received.
+
+   paid
+   paid in full
+   settled
+   payment received
 
    Return false for wording such as:
-   unpaid, awaiting payment, outstanding, pending payment.
+
+   unpaid
+   awaiting payment
+   outstanding
+   pending payment
 
 7. priority
+
    Return exactly one lowercase value:
-   low, normal, high or urgent.
+
+   low
+   normal
+   high
+   urgent
 
    Preserve explicitly stated priority.
+
    Interpret critical, immediate or ASAP as urgent.
    Interpret important as high.
    Interpret routine as low.
    Use normal when no special priority is indicated.
 
 8. contact_email
+
    Return the invoice contact or billing email.
+
    Convert it to lowercase.
 
 9. line_items
+
    Extract each line item in the same order it appears.
 
    Each item must contain exactly:
+
    sku
    quantity
    unit_price
@@ -554,23 +693,27 @@ Follow these rules strictly:
    document explicitly presents them as SKU line items.
 
 10. item_count
+
     Return the number of extracted line items.
 
 11. Ignore unrelated numbers such as:
-    telephone numbers,
-    postal codes,
-    account identifiers,
-    shipment distances,
-    tax registration numbers,
-    document page numbers,
-    years appearing outside the invoice date.
+
+    telephone numbers
+    postal codes
+    account identifiers
+    shipment distances
+    tax registration numbers
+    document page numbers
+    years appearing outside the invoice date
 
 12. Return exactly the required keys.
+
     Do not add explanations, markdown or extra fields.
 """.strip()
 
     user_prompt = f"""
 Document ID:
+
 {document_id}
 
 Invoice document:
@@ -579,11 +722,13 @@ Invoice document:
 {document_text}
 --- DOCUMENT END ---
 
-The grader also supplied this JSON Schema:
+The grader supplied this JSON Schema:
 
 {json.dumps(grader_schema, ensure_ascii=False)}
 
-Extract the invoice carefully and return only the required JSON object.
+Extract the invoice carefully.
+
+Return only the required JSON object.
 """.strip()
 
     try:
@@ -615,7 +760,10 @@ Extract the invoice carefully and return only the required JSON object.
         if not content:
             raise HTTPException(
                 status_code=502,
-                detail="Invoice model returned an empty response",
+                detail=(
+                    "Invoice model returned "
+                    "an empty response"
+                ),
             )
 
         raw_result = json.loads(content)
@@ -623,7 +771,10 @@ Extract the invoice carefully and return only the required JSON object.
         if not isinstance(raw_result, dict):
             raise HTTPException(
                 status_code=502,
-                detail="Invoice model did not return an object",
+                detail=(
+                    "Invoice model did not "
+                    "return an object"
+                ),
             )
 
         print(
@@ -680,7 +831,7 @@ def invoice_intelligence(
     result = extract_invoice(
         document_id=request.document_id,
         document_text=request.text,
-        grader_schema=request.schema,
+        grader_schema=request.requested_schema,
     )
 
     print(
