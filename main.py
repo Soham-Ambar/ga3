@@ -23,6 +23,10 @@ print("MAIN: importing Q8", flush=True)
 from q8_semantic_search import router as q8_router
 print("MAIN: Q8 imported", flush=True)
 
+print("MAIN: importing Q9", flush=True)
+from q9_word_problem_solver import router as q9_router
+print("MAIN: Q9 imported", flush=True)
+
 
 app = FastAPI()
 
@@ -34,11 +38,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Existing working endpoints
 app.include_router(q2_router)
 app.include_router(q3_router)
 app.include_router(q4_router)
 app.include_router(q7_router)
 app.include_router(q8_router)
+
+# Q9
+app.include_router(q9_router)
 
 
 @app.get("/")
@@ -51,6 +59,7 @@ def root():
             "/dynamic-extract",
             "/invoice-intelligence",
             "/semantic-search",
+            "/solve-word-problem",
         ],
     }
 
