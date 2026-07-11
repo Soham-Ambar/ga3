@@ -15,6 +15,10 @@ print("MAIN: importing Q4", flush=True)
 from q4_dynamic_extract import router as q4_router
 print("MAIN: Q4 imported", flush=True)
 
+print("MAIN: importing Q6", flush=True)
+from q6_audio_stats import router as q6_router
+print("MAIN: Q6 imported", flush=True)
+
 print("MAIN: importing Q7", flush=True)
 from q7_invoice_intelligence import router as q7_router
 print("MAIN: Q7 imported", flush=True)
@@ -44,9 +48,9 @@ app.include_router(q3_router)
 app.include_router(q4_router)
 app.include_router(q7_router)
 app.include_router(q8_router)
-
-# Q9
 app.include_router(q9_router)
+app.include_router(q6_router)
+
 
 
 @app.get("/")
@@ -60,6 +64,7 @@ def root():
             "/invoice-intelligence",
             "/semantic-search",
             "/solve-word-problem",
+            "/audio-stats",
         ],
     }
 
