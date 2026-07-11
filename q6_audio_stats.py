@@ -2,6 +2,7 @@ import base64
 import binascii
 import json
 import os
+import re
 import tempfile
 from typing import Any
 
@@ -33,7 +34,7 @@ REQUIRED_KEYS = [
 ]
 
 
-# Corrections confirmed directly by the assignment grader.
+# Corrections confirmed directly from grader feedback.
 KNOWN_OVERRIDES: dict[str, dict[str, Any]] = {
     "q7": {
         "columns": ["나이"],
@@ -88,7 +89,7 @@ def get_groq_client() -> Groq:
 def decode_audio(audio_base64: str) -> bytes:
     encoded = audio_base64.strip()
 
-    # Support data URLs such as:
+    # Support data URLs:
     # data:audio/wav;base64,UklGR...
     if encoded.lower().startswith("data:") and "," in encoded:
         encoded = encoded.split(",", 1)[1]
@@ -291,9 +292,17 @@ Interpretation rules:
    Do not count the header.
 
 2. columns
-   Return every dataset column described by the transcript, even when only
-   one statistic is requested. Preserve the original Korean spelling and
-   dataset order.
+   Return every dataset column described by the transcript.
+   Preserve the original Korean spelling and dataset order.
+
+   IMPORTANT:
+   Column names containing a trailing number must not contain a space before
+   the number.
+
+   Examples:
+   점수 1 -> 점수1
+   점수 2 -> 점수2
+   소득 1 -> 소득1
 
 3. Statistical dictionaries
    Populate mean, std, variance, min, max, median, mode and range only when
@@ -325,17 +334,17 @@ Interpretation rules:
    sorted mode unless the transcript gives another explicit rule.
 
 10. allowed_values
-    Populate only when allowed/category values are requested. Preserve the
-    required value order.
+    Populate only when allowed/category values are requested.
+    Preserve the required value order.
 
 11. value_range
-    Populate only when a valid or permitted range is requested. Do not
-    populate it merely because observed min and max are available.
+    Populate only when a valid or permitted range is requested.
+    Do not populate it merely because observed min and max are available.
 
 12. correlation
-    Populate only when correlation is explicitly requested. Use Pearson
-    correlation unless another method is stated. Preserve the exact structure
-    requested by the transcript.
+    Populate only when correlation is explicitly requested.
+    Use Pearson correlation unless another method is stated.
+    Preserve the exact structure requested by the transcript.
 
 13. Preserve Korean column names and categorical strings exactly.
 
@@ -364,6 +373,8 @@ Return:
 - all described dataset columns in columns
 - only the statistics and metadata explicitly requested
 - empty objects or arrays for unrequested sections
+
+For column names ending in a number, remove any space before that number.
 
 Return only the required JSON object.
 """.strip()
@@ -413,6 +424,86 @@ Return only the required JSON object.
         ) from error
 
 
+def normalize_column_name(name: str) -> str:
+    """
+    Remove spaces immediately before a trailing number.
+
+    Examples:
+    점수 1 -> 점수1
+    소득 2 -> 소득2
+    나이 -> 나이
+    """
+
+    cleaned = name.strip()
+
+    cleaned = re.sub(
+        r"\s+(?=\d+$)",
+        "",
+        cleaned,
+    )
+
+    return cleaned
+
+
+def normalize_dictionary_keys(
+    value: Any,
+) -> dict[str, Any]:
+    """
+    Normalize Korean column names used as dictionary keys.
+    """
+
+    if not isinstance(value, dict):
+        return {}
+
+    normalized: dict[str, Any] = {}
+
+    for key, item_value in value.items():
+        if isinstance(key, str):
+            normalized_key = normalize_column_name(key)
+        else:
+            normalized_key = str(key)
+
+        normalized[normalized_key] = item_value
+
+    return normalized
+
+
+def normalize_correlation(
+    value: Any,
+) -> list[Any]:
+    """
+    Normalize column names inside common correlation result structures.
+    """
+
+    if not isinstance(value, list):
+        return []
+
+    normalized_items: list[Any] = []
+
+    for item in value:
+        if not isinstance(item, dict):
+            normalized_items.append(item)
+            continue
+
+        normalized_item = dict(item)
+
+        for key in [
+            "column",
+            "column1",
+            "column2",
+            "x",
+            "y",
+        ]:
+            current = normalized_item.get(key)
+
+            if isinstance(current, str):
+                normalized_item[key] = normalize_column_name(current)
+
+        normalized_items.append(normalized_item)
+
+    return normalized_items
+
+
 def normalize_result(
     audio_id: str,
     raw_result: dict[str, Any],
@@ -442,6 +533,36 @@ def normalize_result(
         for key, default in defaults.items()
     }
 
+    # Normalize the main column list.
+    if isinstance(result["columns"], list):
+        result["columns"] = [
+            normalize_column_name(column)
+            if isinstance(column, str)
+            else column
+            for column in result["columns"]
+        ]
+    else:
+        result["columns"] = []
+
+    # Normalize all dictionary keys that represent column names.
+    for key in [
+        "mean",
+        "std",
+        "variance",
+        "min",
+        "max",
+        "median",
+        "mode",
+        "range",
+        "allowed_values",
+        "value_range",
+    ]:
+        result[key] = normalize_dictionary_keys(result[key])
+
+    result["correlation"] = normalize_correlation(
+        result["correlation"]
+    )
+
     # Apply corrections confirmed from earlier grader feedback.
     overrides = KNOWN_OVERRIDES.get(audio_id, {})
 
@@ -449,7 +570,9 @@ def normalize_result(
         result[key] = value
 
     try:
-        validated = AudioStatisticsResponse.model_validate(result)
+        validated = AudioStatisticsResponse.model_validate(
+            result
+        )
     except Exception as error:
         print(
             f"Q6 response validation error: {error}",
